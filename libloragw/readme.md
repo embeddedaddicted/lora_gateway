@@ -21,15 +21,18 @@ radio used to send and receive packets wirelessly using LoRa or FSK modulations.
 2. Components of the library
 ----------------------------
 
-The library is composed of 5 modules:
+The library is composed of 6(8) modules:
 
 * loragw_hal
 * loragw_reg
 * loragw_spi
 * loragw_aux
 * loragw_gps
+* loragw_radio
+* loragw_fpga (only for SX1301AP2 ref design)
+* loragw_lbt (only for SX1301AP2 ref design)
 
-The library also contains 4 test programs to demonstrate code use and check
+The library also contains basic test programs to demonstrate code use and check
 functionality.
 
 ### 2.1. loragw_hal ###
@@ -50,21 +53,24 @@ use the LoRa concentrator:
 For an standard application, include only this module.
 The use of this module is detailed on the usage section.
 
-/!\ When sending a packet, there is a 1.5 ms delay for the analog circuitry to
-start and be stable (TX_START_DELAY).
+/!\ When sending a packet, there is a delay (approx 1.5ms) for the analog
+circuitry to start and be stable. This delay is adjusted by the HAL depending
+on the board version (lgw_i_tx_start_delay_us).
 
-In 'timestamp' mode, this is transparent: the modem is started 1.5ms before the
-user-set timestamp value is reached, the preamble of the packet start right when
-the internal timestamp counter reach target value.
+In 'timestamp' mode, this is transparent: the modem is started
+lgw_i_tx_start_delay_us microseconds before the user-set timestamp value is
+reached, the preamble of the packet start right when the internal timestamp
+counter reach target value.
 
 In 'immediate' mode, the packet is emitted as soon as possible: transferring the
 packet (and its parameters) from the host to the concentrator takes some time,
-then there is the TX_START_DELAY, then the packet is emitted.
+then there is the lgw_i_tx_start_delay_us, then the packet is emitted.
 
-In 'triggered' mode (aka PPS/GPS mode), the packet, typically a beacon, is 
-emitted 1.5ms after a rising edge of the trigger signal. Because there is no
-way to anticipate the triggering event and start the analog circuitry
-beforehand, that delay must be taken into account in the protocol.
+In 'triggered' mode (aka PPS/GPS mode), the packet, typically a beacon, is
+emitted lgw_i_tx_start_delay_us microsenconds after a rising edge of the
+trigger signal. Because there is no way to anticipate the triggering event and
+start the analog circuitry beforehand, that delay must be taken into account in
+the protocol.
 
 ### 2.2. loragw_reg ###
 
@@ -140,25 +146,126 @@ The internal concentrator counter is used to timestamp incoming packets and to
 triggers outgoing packets with a microsecond accuracy.
 In some cases, it might be useful to be able to transform that internal 
 timestamp (that is independent for each concentrator running in a typical 
-networked system) into an absolute UTC time.
+networked system) into an absolute GPS time.
 
 In a typical implementation a GPS specific thread will be called, doing the
 following things after opening the serial port:
 
 * blocking reads on the serial port (using system read() function)
-* parse NMEA sentences (using lgw_parse_nmea)
+* parse UBX messages (using lgw_parse_ubx) to get actual native GPS time
+* parse NMEA sentences (using lgw_parse_nmea) to get location and UTC time
+Note: the RMC sentence gives UTC time, not native GPS time.
 
-And each time an RMC sentence has been received:
+And each time an NAV-TIMEGPS UBX message has been received:
 
 * get the concentrator timestamp (using lgw_get_trigcnt, mutex needed to 
   protect access to the concentrator)
-* get the UTC time contained in the NMEA sentence (using lgw_gps_get)
+* get the GPS time contained in the UBX message (using lgw_gps_get)
 * call the lgw_gps_sync function (use mutex to protect the time reference that 
   should be a global shared variable).
 
 Then, in other threads, you can simply used that continuously adjusted time 
-reference to convert internal timestamps to UTC time (using lgw_cnt2utc) or 
-the other way around (using lgw_utc2cnt).
+reference to convert internal timestamps to GPS time (using lgw_cnt2gps) or
+the other way around (using lgw_gps2cnt). Inernal concentrator timestamp can
+also be converted to/from UTC time using lgw_cnt2utc/lgw_utc2cnt functions.
+
+### 2.6. loragw_radio ###
+
+This module contains functions to handle the configuration of SX125x and
+SX127x radios.
+
+### 2.7. loragw_fpga ###
+
+This module contains the description of the FPGA registers, the functions to
+read/write those registers, and a function to configure the FPGA features.
+
+This module is only required for SX1301AP2 reference design.
+
+### 2.8. loragw_lbt ###
+
+This module contains functions to configure and use the "Listen-Before-Talk"
+feature (refered as LBT below). It depends on the loragw_fpga and loragw_radio
+modules.
+
+LBT feature is only available on SX1301AP2 reference design, which provides the
+FPGA and the SX127x radio required to accomplish the feature.
+
+The FPGA implements the following Finite State Machine (FSM) to scan the defined
+LBT channels (8 max), and also compute the RSSI histogram for spectral scan,
+using the SX127x radio.
+
+
+                          +-------+
+      +------------------>+ idle  +------------------+
+      |                   +-------+                  v
+      |                       |                +-----------+
+      |                       |                | clean mem |
+      |                       v                +-----------+
+      |                  +----------+                |
+      |                  | set freq |<---------------+
+      |                  +----------+
+      |                       |
+      |                       v
+      |                  +----------+
+      |                  | wait pll |
+      |                  |   lock   |
+      |                  +----------+
+      |                       |                (SCAN_CHANNEL)
+      |                       v                +-----------+
+      |                 +-----------+          |           |
+      |                 |           +----------+           v
+      |             +-->| read RSSI |                +------------+
+      |             |   |           +<---------------+ calc histo |
+      |             |   +-----------+   SCANNING     +------------+
+      |             |         |                            |
+      |    SCANNING |         | (LBT_CHANNEL)              |
+      |             |         v                            |
+      |             |  +-------------+                     |
+      |             |  |   compare   |                     |
+      |             +--+     with    |                     |
+      |                | RSSI_TARGET |          HISTO_DONE |
+      |                +-------------+                     |
+      |                       |                            |
+      |             SCAN DONE |                            |
+      |                       v                            |
+      |                 +------------+                     |
+      |                 |  increase  |                     |
+      +-----------------+            +<--------------------+
+                        |    freq    |
+                        +------------+
+
+
+
+In order to configure the LBT, the following parameters have to be set:
+- RSSI_TARGET: signal strength target used to detect if the channel is clear
+               or not.
+               RSSI_TARGET_dBm = -RSSI_TARGET/2
+- LBT_CHx_FREQ_OFFSET: with x=[0..7], offset from the predefined LBT start
+                       frequency (863MHz or 915MHz depending on FPGA image),
+                       in 100KHz unit.
+- LBT_SCAN_TIME_CHx: with x=[0..7], the channel scan time to be used for this
+                     LBT channel: 128µs or 5000µs
+
+With this FSM, the FPGA keeps the last instant when each channel was free during
+more than LBT_SCAN_TIME_CHx µs.
+
+Then, the HAL, when receiving a downlink request, will first determine on which
+LBT channel this downlink is supposed to be sent and then checks if the channel
+is busy or if downlink is allowed.
+
+In order to determine if a downlink is allowed or not, the HAL does:
+- read the LBT_TIMESTAMP_CH of the channel on which downlink is requested. This
+  gives the last time when channel was free (LBT_TIME).
+- compute the time on air of the downlink packet to determine the end time of
+  the packet emission (PKT_END_TIME).
+- if ((PKT_END_TIME - LBT_TIME) < TX_MAX_TIME)
+    ALLOWED = TRUE
+  else
+    ALLOWED = FALSE
+  endif
+    where TX_MAX_TIME is the maximum time allowed to send a packet since the
+    last channel free time (this depends on the channel scan time ).
+
 
 3. Software build process
 --------------------------
@@ -179,8 +286,12 @@ messages if the DEBUG_xxx is set to 1 in library.cfg
 
 ### 3.3. Building procedures ###
 
-For cross-compilation set the CROSS_COMPILE variable in the Makefile with the
-correct toolchain name.
+For cross-compilation set the ARCH and CROSS_COMPILE variables in the Makefile,
+or in your shell environment, with the correct toolchain name and path.
+ex:
+export PATH=/home/foo/rpi-toolchain/tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin:$PATH
+export ARCH=arm
+export CROSS_COMPILE=arm-linux-gnueabihf-
 
 The Makefile in the libloragw directory will parse the library.cfg file and 
 generate a config.h C header file containing #define options.
@@ -247,20 +358,13 @@ sudo to run all your programs (eg. `sudo ./test_loragw_gps`).
 
 In the current revision, the library only reads data from the serial port, 
 expecting to receive NMEA frames that are generally sent by GPS receivers as 
-soon as they are powered up.
+soon as they are powered up, and UBX messages which are proprietary to u-blox
+modules.
 
-The GPS receiver **MUST** send RMC NMEA sentences (starting with "$G<any 
-character>RMC") shortly after sending a PPS pulse on to allow internal 
-concentrator timestamps to be converted to absolute UTC time.
-If the GPS receiver sends a GGA sentence, the gateway 3D position will also be 
-available.
-
-The PPS pulse must be sent to the pin 22 of connector CONN400 on the Semtech 
-FPGA-based nano-concentrator board. Ground is available on pins 2 and 12 of 
-the same connector.
-The pin is loaded by an FPGA internal pull-down, and the signal level coming 
-in the FPGA must be 3.3V.
-Timing is captured on the rising edge of the PPS signal.
+The GPS receiver **MUST** send UBX messages shortly after sending a PPS pulse
+on to allow internal concentrator timestamps to be converted to absolute GPS time.
+If the GPS receiver sends a GGA NMEA sentence, the gateway 3D position will
+also be available.
 
 5. Usage
 --------
@@ -272,7 +376,6 @@ For a typical application you need to:
 * include loragw_hal.h in your program source
 * link to the libloragw.a static library during compilation
 * link to the librt library due to loragw_aux dependencies (timing functions)
-* link to the libmpsse library if you use a FTDI SPI-over-USB bridge
 
 For an application that will also access the concentrator configuration 
 registers directly (eg. for advanced configuration) you also need to:
